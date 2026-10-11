@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Drop-in stand-in for espeak, so VS Code extensions that use the system
+"local TTS" path get the Kokoro voice instead of the robotic espeak one.
+
+The Eloquent extension (jshwek.eloquent) calls, on Linux:
+    espeak -w <out.wav> -s <words per minute> <text>
+and then reads the WAV back. Only that shape is needed, but the common
+no-op flags are tolerated.
+
+The work is done by the resident tts_server.py daemon, which keeps the model
+in RAM (~1 s per call). If it is not running it is started here, and the
+daemon queues this request until the model has loaded.
+
+Override the install location with CLAUDE_TTS_DIR if it is not the default.
+"""
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+TTS_DIR = os.path.expanduser(os.environ.get("CLAUDE_TTS_DIR", "~/.claude/scripts/tts"))
+SOCK = os.path.join(tempfile.gettempdir(), "claude-tts.sock")
+ESPEAK_DEFAULT_WPM = 175.0   # espeak's own default rate, == speed 1.0
+TAKES_VALUE = {"-w", "-s", "-v", "-a", "-p", "-g", "-b", "-l", "-k", "-f"}
+REPLY_TIMEOUT = 180         # the daemon may still be loading the model
+STARTUP_WAIT = 60           # seconds to wait for a freshly started daemon
+
+
+def parse(argv):
+    out, wpm, words = None, ESPEAK_DEFAULT_WPM, []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in TAKES_VALUE and i + 1 < len(argv):
+            val = argv[i + 1]
+            if a == "-w":
+                out = val
+            elif a == "-s":
+                try:
+                    wpm = float(val)
+                except ValueError:
+                    pass
+            i += 2
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        words.append(a)
+        i += 1
+    return out, wpm, " ".join(words)
+
+
+def render(out, speed, text):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(REPLY_TIMEOUT)
+    s.connect(SOCK)
+    s.sendall(f"RENDER\t{out}\t{speed}\t{text}\n".encode("utf-8"))
+    reply = s.recv(4096).decode("utf-8", "replace").strip()
+    s.close()
+    if not reply.startswith("OK"):
+        raise RuntimeError(reply or "no reply from tts_server")
+
+
+def start_daemon():
+    server = os.path.join(TTS_DIR, "tts_server.py")
+    python = os.path.join(TTS_DIR, "venv/bin/python3")
+    if not os.path.exists(python):
+        raise RuntimeError(f"no venv python at {python} (set CLAUDE_TTS_DIR?)")
+    with open(os.path.join(TTS_DIR, "tts_server.log"), "ab") as log:
+        subprocess.Popen([python, server], stdin=subprocess.DEVNULL,
+                         stdout=log, stderr=subprocess.STDOUT,
+                         start_new_session=True)
+    deadline = time.time() + STARTUP_WAIT
+    while time.time() < deadline:
+        if os.path.exists(SOCK):
+            return
+        time.sleep(0.5)
+    raise RuntimeError("tts_server did not start")
+
+
+def main():
+    out, wpm, text = parse(sys.argv[1:])
+    if not text:
+        text = sys.stdin.read().strip()
+    if not text:
+        return 0
+    if not out:
+        # espeak would speak straight to the sound card; nothing asks for that
+        # here, and WSL has no audio device anyway.
+        print("espeak shim: -w <file> is required", file=sys.stderr)
+        return 1
+    speed = round(wpm / ESPEAK_DEFAULT_WPM, 3)
+    try:
+        render(out, speed, text)
+        return 0
+    except (OSError, RuntimeError) as e:
+        print(f"espeak shim: {e}; starting the daemon", file=sys.stderr)
+    try:
+        start_daemon()
+        render(out, speed, text)
+    except (OSError, RuntimeError) as e:
+        print(f"espeak shim: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    return_code = main()
+    sys.exit(return_code)
